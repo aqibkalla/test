@@ -1,0 +1,270 @@
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+BASE_URL = 'https://api.india.delta.exchange'
+
+def fetch_historical_candles(symbol='BTCUSD', resolution='2h', limit=500):
+    url = f'{BASE_URL}/v2/history/candles'
+    interval_map = {'1m':60,'2m':120,'5m':300,'15m':900,'30m':1800,
+                    '1h':3600,'2h':7200,'4h':14400,'1d':86400}
+    interval_seconds = interval_map.get(resolution)
+    if interval_seconds is None:
+        raise ValueError(f"Unsupported resolution: {resolution}")
+    end = int(time.time())
+    start = end - (interval_seconds * limit)
+    params = {'symbol':symbol, 'resolution':resolution, 'start':start, 'end':end, 'limit':limit}
+    resp = requests.get(url, params=params)
+    data = resp.json()
+    if 'result' not in data or data['result'] is None:
+        raise Exception(f"Error fetching data: {data}")
+    df = pd.DataFrame(data['result'])
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df = df.sort_values('time')
+    for col in ['open','high','low','close','volume']:
+        df[col] = df[col].astype(float)
+    df.set_index('time', inplace=True)
+    return df
+
+def calculate_ema(df, period=21):
+    return df['close'].ewm(span=period, adjust=False).mean()
+
+def test_21_ema_strategy_capital_risk(df,
+                                       starting_capital=100,
+                                       leverage=50,
+                                       risk_pct=0.02,
+                                       target_pct=0.05,
+                                       stoploss_points=500):
+    df['EMA21'] = calculate_ema(df, 21)
+    df['position'] = 0
+    df['candle_color'] = np.where(df['close']>df['open'], 'green', 'red')
+    
+    for i in range(1, len(df)):
+        if df['close'].iat[i]>df['EMA21'].iat[i] and df['candle_color'].iat[i]=='green':
+            df['position'].iat[i] = 1
+        elif df['close'].iat[i]<df['EMA21'].iat[i] and df['candle_color'].iat[i]=='red':
+            df['position'].iat[i] = -1
+        else:
+            df['position'].iat[i] = 0
+    
+    df['position'] = df['position'].replace(to_replace=0, method='ffill').fillna(0)
+    df['trade_signal'] = df['position'].diff()
+    
+    capital = starting_capital
+    capital_over_time = []
+    capital_dates = []
+    trades = []
+    open_trade = None
+    
+    for i in range(1, len(df)):
+        if capital <= 0:
+            print("Capital has depleted to zero or below. Stopping trading.")
+            break
+        
+        signal_change = df['trade_signal'].iat[i]!=0
+        capital_dates.append(df.index[i])
+        capital_over_time.append(capital)
+        
+        if open_trade is not None:
+            high = df['high'].iat[i]
+            low = df['low'].iat[i]
+            entry = open_trade['entry_price']
+            pos = open_trade['position']
+            
+            # Computing stoploss and target in price terms based on capital risk/target %
+            risk_dollars = capital * risk_pct
+            target_dollars = capital * target_pct
+            
+            # Calculate units by capital*leverage / entry price max quantity possible
+            max_trade_value = capital * leverage
+            units = max_trade_value / entry
+            
+            # Price distance for stoploss and target based on fixed points (assumed)
+            sl_price_dist = stoploss_points
+            # However for risk control, adjust effective sl_price_dist to match risk_dollars with units
+            # If units * sl_price_dist > risk_dollars, adjust units down
+            max_units_by_risk = risk_dollars / sl_price_dist
+            units = min(units, max_units_by_risk)
+            
+            sl_level = entry - sl_price_dist if pos == 1 else entry + sl_price_dist
+            # Target price derived from target dollars and units
+            target_price_dist = target_dollars / units
+            target_level = entry + target_price_dist if pos == 1 else entry - target_price_dist
+            
+            exit_reason = None
+            exit_price = None
+            
+            if pos == 1:
+                if low <= sl_level:
+                    exit_price = sl_level
+                    exit_reason = 'Stoploss'
+                elif high >= target_level:
+                    exit_price = target_level
+                    exit_reason = 'Target'
+            else:
+                if high >= sl_level:
+                    exit_price = sl_level
+                    exit_reason = 'Stoploss'
+                elif low <= target_level:
+                    exit_price = target_level
+                    exit_reason = 'Target'
+            
+            if exit_reason is None and signal_change:
+                exit_price = df['open'].iat[i]
+                exit_reason = 'Signal Change'
+                
+            if exit_price is not None:
+                pnl_points = (exit_price - entry) if pos==1 else (entry - exit_price)
+                pnl_capital = pnl_points * units
+                capital += pnl_capital
+                trades.append({
+                    'entry_time': open_trade['entry_time'],
+                    'exit_time': df.index[i],
+                    'position': pos,
+                    'entry_price': entry,
+                    'exit_price': exit_price,
+                    'pnl_points': pnl_points,
+                    'pnl_capital': pnl_capital,
+                    'exit_reason': exit_reason,
+                    'stoploss': sl_level,
+                    'target': target_level,
+                    'units': units,
+                    'risk_dollars': risk_dollars,
+                    'target_dollars': target_dollars
+                })
+                open_trade = None
+        
+        if signal_change and df['position'].iat[i] != 0 and open_trade is None:
+            open_trade = {
+                'entry_time': df.index[i],
+                'entry_price': df['open'].iat[i],
+                'position': df['position'].iat[i]
+            }
+    
+    # close last open trade at final close price if any
+    if open_trade is not None and capital > 0:
+        close_price = df['close'].iat[i]
+        pos = open_trade['position']
+        
+        risk_dollars = capital * risk_pct
+        max_trade_value = capital * leverage
+        units = max_trade_value / open_trade['entry_price']
+        sl_price_dist = stoploss_points
+        max_units_by_risk = risk_dollars / sl_price_dist
+        units = min(units, max_units_by_risk)
+        
+        pnl_points = (close_price - open_trade['entry_price']) if pos==1 else (open_trade['entry_price'] - close_price)
+        pnl_capital = pnl_points * units
+        capital += pnl_capital
+        
+        trades.append({
+            'entry_time': open_trade['entry_time'],
+            'exit_time': df.index[i],
+            'position': pos,
+            'entry_price': open_trade['entry_price'],
+            'exit_price': close_price,
+            'pnl_points': pnl_points,
+            'pnl_capital': pnl_capital,
+            'exit_reason': 'EOD Close',
+            'stoploss': open_trade['entry_price'] - sl_price_dist if pos==1 else open_trade['entry_price'] + sl_price_dist,
+            'target': open_trade['entry_price'] + target_dollars/units if pos==1 else open_trade['entry_price'] - target_dollars/units,
+            'units': units,
+            'risk_dollars': risk_dollars,
+            'target_dollars': target_dollars
+        })
+        capital_dates.append(df.index[i])
+        capital_over_time.append(capital)
+    
+    total_trades = len(trades)
+    wins = sum(1 for t in trades if t['pnl_capital'] > 0)
+    losses = total_trades - wins
+    net_profit = capital - starting_capital
+    accuracy = wins / total_trades if total_trades > 0 else 0
+    
+    summary = {
+        'starting_capital': starting_capital,
+        'ending_capital': capital,
+        'total_trades': total_trades,
+        'wins': wins,
+        'losses': losses,
+        'accuracy': accuracy,
+        'net_profit': net_profit
+    }
+    
+    return df, trades, summary, capital_dates, capital_over_time
+
+def plot_strategy_results(df, trades, summary, capital_dates, capital_over_time):
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1, figsize=(16,14), gridspec_kw={'height_ratios':[3,1,1]})
+    fig.suptitle('21 EMA Strategy - BTCUSD - Leveraged Trading with Risk Management', fontsize=16)
+
+    ax1.plot(df.index, df['close'], label='Close Price', color='blue')
+    ax1.plot(df.index, df['EMA21'], label='21 EMA', color='orange')
+
+    for t in trades:
+        entry_idx = df.index.get_loc(t['entry_time'])
+        exit_idx = df.index.get_loc(t['exit_time'])
+        ax1.plot([df.index[entry_idx], df.index[exit_idx]], [t['entry_price'], t['exit_price']],
+                 color='green' if t['pnl_capital']>0 else 'red', linewidth=2, alpha=0.7)
+        ax1.scatter(t['entry_time'], t['entry_price'], marker='^', color='green', s=80)
+        ax1.scatter(t['exit_time'], t['exit_price'], marker='v', color='red', s=80)
+        ax1.hlines(t['stoploss'], df.index[entry_idx], df.index[exit_idx],
+                   colors='red', linestyles='dashed', alpha=0.4)
+        ax1.hlines(t['target'], df.index[entry_idx], df.index[exit_idx],
+                   colors='green', linestyles='dashed', alpha=0.4)
+
+    ax1.set_ylabel('Price')
+    ax1.legend(loc='upper left')
+    ax1.grid(True)
+
+    ax2.bar(['Winning Trades', 'Losing Trades'], [summary['wins'], summary['losses']], color=['green', 'red'])
+    ax2.set_ylabel('Number of Trades')
+    ax2.grid(axis='y')
+
+    ax3.plot(capital_dates, capital_over_time, label='Capital Over Time', color='purple')
+    ax3.set_ylabel('Capital ($)')
+    ax3.set_xlabel('Date')
+    ax3.legend()
+    ax3.grid(True)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+
+if __name__=="__main__":
+    starting_capital = 100
+    leverage = 50
+    symbol = 'BTCUSD'
+    risk_per_trade = 0.02   # 2% risk per trade
+    target_per_trade = 0.05 # 5% target per trade
+    stoploss_points = 500   # 500 points stoploss
+    
+    print(f"Fetching 2-hour BTCUSD data...")
+    df = fetch_historical_candles(symbol=symbol, resolution='2h', limit=500)
+    
+    print(f"Simulating trades with starting capital ${starting_capital}, leverage {leverage}x, risk per trade {risk_per_trade*100}%, target per trade {target_per_trade*100}%.")
+    
+    df, trades, summary, capital_dates, capital_over_time = test_21_ema_strategy_capital_risk(
+        df,
+        starting_capital=starting_capital,
+        leverage=leverage,
+        risk_pct=risk_per_trade,
+        target_pct=target_per_trade,
+        stoploss_points=stoploss_points)
+    
+    print("\nStrategy Summary:")
+    print(f"Starting Capital: ${summary['starting_capital']:.2f}")
+    print(f"Ending Capital: ${summary['ending_capital']:.2f}")
+    print(f"Total Trades: {summary['total_trades']}")
+    print(f"Winning Trades: {summary['wins']} | Losing Trades: {summary['losses']} | Accuracy: {summary['accuracy']*100:.2f}%")
+    print(f"Net Profit/Loss: ${summary['net_profit']:.2f}")
+    
+    print("\nTrade details:")
+    for t in trades:
+        print(f"Entry: {t['entry_time']}, Exit: {t['exit_time']}, "
+              f"Pos: {'Long' if t['position']==1 else 'Short'}, "
+              f"Units: {t['units']:.5f}, Entry Price: {t['entry_price']:.2f}, Exit Price: {t['exit_price']:.2f}, "
+              f"PnL Points: {t['pnl_points']:.2f}, PnL Capital: ${t['pnl_capital']:.2f}, Exit Reason: {t['exit_reason']} ")
+    
+    plot_strategy_results(df, trades, summary, capital_dates, capital_over_time)
